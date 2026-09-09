@@ -57,3 +57,27 @@ delete[] json;
 // Clear internal CPU time history (useful for tests)
 ProcessStats::clearHistory();
 ```
+
+## Output format
+
+`ProcessStats::getModuleStats()` returns a JSON array with one entry per process in the input map (entries with an invalid PID, i.e. `pid <= 0`, are skipped). Each entry has the following fields:
+
+- `name` — string. The process name, taken from the key in the input map.
+- `pid` — integer. The process ID, taken from the value in the input map.
+- `cpu_percent` — number. CPU usage percentage since the previous sample for this PID (`0.0` on the first sample).
+- `cpu_time_seconds` — number. Total CPU time consumed by the process, in seconds.
+- `memory_mb` — number. Memory usage of the process, in megabytes.
+
+Example with a single entry:
+
+```json
+[
+  {
+    "name": "my_process",
+    "pid": 1234,
+    "cpu_percent": 1.5,
+    "cpu_time_seconds": 10.2,
+    "memory_mb": 45.3
+  }
+]
+```
