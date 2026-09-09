@@ -57,3 +57,5 @@ delete[] json;
 // Clear internal CPU time history (useful for tests)
 ProcessStats::clearHistory();
 ```
+
+<!-- fleet ci probe -->
