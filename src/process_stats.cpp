@@ -8,7 +8,15 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#if defined(__APPLE__) && !defined(__IOS__)
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
+// libproc and the mach task_info APIs below exist on macOS only; iOS sandboxes
+// away every other process. TARGET_OS_IPHONE (from <TargetConditionals.h>, 0 on
+// macOS, 1 on iOS and the simulator) is the SDK's own answer; no compiler or
+// SDK defines an __IOS__ macro.
+#if defined(__APPLE__) && !TARGET_OS_IPHONE
 #include <libproc.h>
 #include <mach/mach.h>
 #include <mach/task_info.h>
@@ -51,7 +59,7 @@ ProcessStatsData getProcessStats(int64_t pid)
     if (pid <= 0)
         return stats;
 
-#if defined(__APPLE__) && !defined(__IOS__)
+#if defined(__APPLE__) && !TARGET_OS_IPHONE
     struct proc_taskinfo taskInfo;
     int ret = proc_pidinfo(static_cast<int>(pid), PROC_PIDTASKINFO, 0, &taskInfo, sizeof(taskInfo));
 
