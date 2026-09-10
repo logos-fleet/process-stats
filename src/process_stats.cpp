@@ -14,10 +14,8 @@
 
 // libproc and the mach task_info APIs below exist on macOS only; iOS sandboxes
 // away every other process. TARGET_OS_IPHONE (from <TargetConditionals.h>, 0 on
-// macOS, 1 on iOS and the simulator) is the SDK's own answer. The guard used to
-// test a macro no compiler and no SDK ever defines, so an iOS build did not
-// skip this branch -- it failed on the include:
-//   process_stats.cpp:12:10: fatal error: 'libproc.h' file not found
+// macOS, 1 on iOS and the simulator) is the SDK's own answer; no compiler or
+// SDK defines an __IOS__ macro.
 #if defined(__APPLE__) && !TARGET_OS_IPHONE
 #include <libproc.h>
 #include <mach/mach.h>
