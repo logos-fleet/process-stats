@@ -12,6 +12,8 @@
 #include <vector>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <atomic>
+#include <optional>
 
 class ProcessStatsTest : public ::testing::Test {
 protected:
@@ -240,4 +242,140 @@ TEST_F(ProcessStatsTest, GetModuleStats_SkipsInvalidPids)
     EXPECT_EQ(doc[0]["name"].get<std::string>(), "valid_plugin");
 
     delete[] result;
+}
+
+// =============================================================================
+// In-process accounting: measuring code that has NO pid
+// =============================================================================
+//
+// A module in the Native container runs inside the host's own image and reports
+// pid -1, so everything above reads nothing about it: getProcessStats reads a
+// PROCESS and it is not one. These two primitives are what a container can use
+// instead — the footprint of the IMAGE the module was dlopen'd from, and the
+// CPU of the THREAD its handlers run on.
+
+// An address that is certainly inside this test binary's own mapped image.
+static void anAddressInThisImage() {}
+
+TEST_F(ProcessStatsTest, GetImageStats_ResolvesTheImageAnAddressIsIn)
+{
+    ProcessStats::ImageStatsData stats =
+        ProcessStats::getImageStats(reinterpret_cast<const void*>(&anAddressInThisImage));
+
+    EXPECT_TRUE(stats.resolved);
+    EXPECT_GT(stats.mappedBytes, 0u);
+    EXPECT_FALSE(stats.path.empty());
+}
+
+TEST_F(ProcessStatsTest, GetImageStats_ResidentIsASubsetOfTheMapping)
+{
+    ProcessStats::ImageStatsData stats =
+        ProcessStats::getImageStats(reinterpret_cast<const void*>(&anAddressInThisImage));
+
+    ASSERT_TRUE(stats.resolved);
+    if (!stats.residentKnown)
+        GTEST_SKIP() << "this platform will not report residency";
+
+    // The pages of this image that are in physical memory are a SUBSET of the
+    // ones reserved for it; a larger figure would mean the walk had strayed
+    // outside the image.
+    EXPECT_LE(stats.residentBytes, stats.mappedBytes);
+    // The function whose address was passed is in this image and this test is
+    // running, so at least one page of it is resident.
+    EXPECT_GT(stats.residentBytes, 0u);
+}
+
+TEST_F(ProcessStatsTest, GetImageStats_RefusesAnAddressInNoImage)
+{
+    ProcessStats::ImageStatsData stats =
+        ProcessStats::getImageStats(reinterpret_cast<const void*>(0x1));
+
+    EXPECT_FALSE(stats.resolved);
+    EXPECT_EQ(stats.mappedBytes, 0u);
+    EXPECT_EQ(stats.residentBytes, 0u);
+}
+
+TEST_F(ProcessStatsTest, GetImageStats_RefusesNull)
+{
+    ProcessStats::ImageStatsData stats = ProcessStats::getImageStats(nullptr);
+
+    EXPECT_FALSE(stats.resolved);
+}
+
+TEST_F(ProcessStatsTest, ThreadCpuClock_IsInvalidUntilItIsCaptured)
+{
+    ProcessStats::ThreadCpuClock clock;
+
+    EXPECT_FALSE(clock.valid());
+    EXPECT_FALSE(clock.cpuTimeSeconds().has_value());
+}
+
+TEST_F(ProcessStatsTest, ThreadCpuClock_ReadsAnotherThreadsCpuTime)
+{
+    // The shape the Native container needs: the clock is captured ON the
+    // module's worker thread and read from whichever thread asks for stats.
+    std::atomic<bool> captured{false};
+    std::atomic<bool> burned{false};
+    std::atomic<bool> release{false};
+    ProcessStats::ThreadCpuClock clock;
+
+    std::thread worker([&] {
+        clock = ProcessStats::ThreadCpuClock::forCurrentThread();
+        captured = true;
+        volatile double sum = 0.0;
+        for (long i = 0; i < 40000000; ++i)
+            sum += i * 0.5;
+        burned = true;
+        while (!release.load())
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    });
+
+    while (!captured.load())
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    EXPECT_TRUE(clock.valid());
+
+    while (!burned.load())
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+    const std::optional<double> seconds = clock.cpuTimeSeconds();
+    release = true;
+    worker.join();
+
+    ASSERT_TRUE(seconds.has_value());
+    EXPECT_GT(*seconds, 0.0);
+}
+
+TEST_F(ProcessStatsTest, ThreadCpuClock_MeasuresOnlyItsOwnThread)
+{
+    // Two threads, one busy: the idle one's clock must not pick up the busy
+    // one's work. That is the whole point of measuring per-thread — a
+    // per-PROCESS reading would give both the same number.
+    std::atomic<bool> captured{false};
+    std::atomic<bool> release{false};
+    ProcessStats::ThreadCpuClock idleClock;
+
+    std::thread idle([&] {
+        idleClock = ProcessStats::ThreadCpuClock::forCurrentThread();
+        captured = true;
+        while (!release.load())
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    });
+
+    while (!captured.load())
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+    volatile double sum = 0.0;
+    for (long i = 0; i < 60000000; ++i)
+        sum += i * 0.5;
+
+    const std::optional<double> idleSeconds = idleClock.cpuTimeSeconds();
+    const std::optional<double> selfSeconds =
+        ProcessStats::ThreadCpuClock::forCurrentThread().cpuTimeSeconds();
+    release = true;
+    idle.join();
+
+    ASSERT_TRUE(idleSeconds.has_value());
+    ASSERT_TRUE(selfSeconds.has_value());
+    EXPECT_LT(*idleSeconds, *selfSeconds)
+        << "an idle thread's clock picked up the busy thread's work";
 }

@@ -60,7 +60,7 @@ ProcessStats::clearHistory();
 
 ## Output format
 
-`ProcessStats::getModuleStats()` returns a JSON array with one entry per process in the input map (entries with an invalid PID, i.e. `pid <= 0`, are skipped). Each entry has the following fields:
+`ProcessStats::getModuleStats()` returns a JSON array with one entry per process in the input map (entries with `pid <= 0` are skipped: a NEGATIVE pid is the documented sentinel for code that runs inside the calling process and is skipped silently — see "Measuring code that has no process" below — while `pid == 0` is a defaulted value and is reported on stderr). Each entry has the following fields:
 
 - `name` — string. The process name, taken from the key in the input map.
 - `pid` — integer. The process ID, taken from the value in the input map.
@@ -81,3 +81,41 @@ Example with a single entry:
   }
 ]
 ```
+
+## Measuring code that has no process
+
+`getProcessStats` and `getModuleStats` read a **process**. Code the host runs
+inside its own image — a module in Logos' Native container, which is the only
+arrangement a phone Store app allows — has no pid, so asking them about it
+produces zeroes that are indistinguishable from an idle process.
+
+Two primitives measure such code directly. Neither names a process, and neither
+is folded into `getModuleStats`: what they need (an address inside the image, a
+handle captured on the thread) is knowledge only the loader holds.
+
+```cpp
+// The image a dlopen'd module was mapped from. Pass any address inside it —
+// one of the symbols the loader resolved out of it will do.
+ProcessStats::ImageStatsData image = ProcessStats::getImageStats(someSymbolInIt);
+// image.resolved       — false if the address is in no known image
+// image.mappedBytes    — address space the loader reserved for it
+// image.residentBytes  — how much of that is in physical memory
+// image.residentKnown  — false where the OS will not answer (then treat
+//                        residentBytes as absent, not as zero)
+// image.path           — the image's path on disk
+
+// One thread's CPU, readable from any other thread. CAPTURE IT ON THE THREAD
+// IT MEASURES: the handle is only obtainable from inside.
+ProcessStats::ThreadCpuClock clock = ProcessStats::ThreadCpuClock::forCurrentThread();
+// ... later, from the thread collecting stats:
+std::optional<double> seconds = clock.cpuTimeSeconds();
+```
+
+A `ThreadCpuClock` goes stale when its thread exits: an exited thread's handle
+can be recycled, so a late read is not reliably an error. Stop reading it when
+you join the thread.
+
+Platform support: `residentBytes` comes from `mincore` on Apple and Linux;
+Windows reports `mappedBytes` only and leaves `residentKnown` false. Thread CPU
+uses the mach thread port on Apple (there is no `pthread_getcpuclockid` there),
+`pthread_getcpuclockid` on Linux, and `GetThreadTimes` on Windows.
