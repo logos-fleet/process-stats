@@ -406,15 +406,37 @@ ImageStatsData getImageStats(const void* addressInImage)
     return stats;
 
 #elif defined(__linux__)
-    // dladdr1 with RTLD_DL_LINKMAP hands back the link_map, whose l_addr is the
-    // load bias this image was mapped with — the ELF half of the Mach-O slide
-    // above. Plain dladdr's dli_fbase is the same value, but only dladdr1 also
-    // gives the entry to match against dl_iterate_phdr below.
+    // THE LOAD BIAS this image was mapped with — the ELF half of the Mach-O
+    // slide above, and the key dl_iterate_phdr below matches on.
+    //
+    // TWO LOADERS, TWO SPELLINGS, and Android is a `__linux__` that has to come
+    // through here. dladdr1 with RTLD_DL_LINKMAP is a GLIBC extension: bionic
+    // has neither the function nor the flag, so this file did not compile for
+    // Android at all and took the whole Shell build down with it. Plain dladdr
+    // is in both, and for a SHARED OBJECT its dli_fbase is the same value the
+    // link_map's l_addr carries.
+    //
+    // It is not the same value for a non-PIE main executable — dli_fbase is the
+    // ELF's base address there and dlpi_addr is 0 — which is why glibc keeps
+    // the link_map rather than both platforms taking the shorter road. Android
+    // has no non-PIE executables to get wrong: PIE has been mandatory since
+    // API 21 and this builds against 28.
     Dl_info info{};
+    ElfW(Addr) bias = 0;
+    // The loader's own name for the image, where it has one to give.
+    const char* linkName = nullptr;
+#if defined(__ANDROID__)
+    if (::dladdr(addressInImage, &info) == 0 || info.dli_fbase == nullptr)
+        return stats;
+    bias = reinterpret_cast<ElfW(Addr)>(info.dli_fbase);
+#else
     link_map* map = nullptr;
     if (::dladdr1(addressInImage, &info, reinterpret_cast<void**>(&map), RTLD_DL_LINKMAP) == 0
         || map == nullptr)
         return stats;
+    bias = map->l_addr;
+    linkName = map->l_name;
+#endif
 
     struct Walk {
         ElfW(Addr) wanted;
@@ -422,7 +444,7 @@ ImageStatsData getImageStats(const void* addressInImage)
         std::uint64_t resident;
         bool residentKnown;
         bool found;
-    } walk{map->l_addr, 0, 0, false, false};
+    } walk{bias, 0, 0, false, false};
 
     ::dl_iterate_phdr(
         [](dl_phdr_info* phdr, std::size_t, void* data) -> int {
@@ -452,9 +474,10 @@ ImageStatsData getImageStats(const void* addressInImage)
     stats.mappedBytes = walk.mapped;
     stats.residentBytes = walk.resident;
     stats.residentKnown = walk.residentKnown;
-    // l_name is empty for the main executable; dli_fname names it.
-    stats.path = (map->l_name && *map->l_name) ? map->l_name
-                                               : (info.dli_fname ? info.dli_fname : "");
+    // l_name is empty for the main executable, and absent altogether where the
+    // link_map is (Android); dli_fname names the image in both cases.
+    stats.path = (linkName && *linkName) ? linkName
+                                         : (info.dli_fname ? info.dli_fname : "");
     return stats;
 
 #elif defined(_WIN32)
