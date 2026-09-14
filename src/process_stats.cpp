@@ -263,12 +263,12 @@ namespace {
 
 #if defined(__APPLE__) || defined(__linux__)
 
-// mincore's residency vector is `char*` on Darwin and `unsigned char*` on
-// Linux, and nothing else about the call differs.
+// One entry of mincore's residency vector: `char` on Darwin and `unsigned
+// char` on Linux, and nothing else about the call differs.
 #if defined(__APPLE__)
-using MincoreVec = char;
+using MincoreByte = char;
 #else
-using MincoreVec = unsigned char;
+using MincoreByte = unsigned char;
 #endif
 
 // How many bytes of [addr, addr+length) are in physical memory, or nullopt if
@@ -288,21 +288,55 @@ std::optional<std::uint64_t> residentBytesIn(const void* addr, std::uint64_t len
     const std::uint64_t span = length + (start - aligned);
     const std::uint64_t pages = (span + pageSize - 1) / pageSize;
 
-    std::vector<MincoreVec> vec(static_cast<std::size_t>(pages), 0);
+    std::vector<MincoreByte> residency(static_cast<std::size_t>(pages), 0);
     if (::mincore(reinterpret_cast<void*>(aligned),
                   static_cast<std::size_t>(pages * pageSize),
-                  vec.data()) != 0)
+                  residency.data()) != 0)
         return std::nullopt;
 
     std::uint64_t resident = 0;
-    for (MincoreVec entry : vec) {
-        if (entry & 1)  // MINCORE_INCORE on Darwin, the same bit on Linux
+    for (MincoreByte page : residency) {
+        if (page & 1)  // MINCORE_INCORE on Darwin, the same bit on Linux
             resident += static_cast<std::uint64_t>(pageSize);
     }
     return resident;
 }
 
 #endif // __APPLE__ || __linux__
+
+#if defined(__APPLE__)
+
+// The ranges a segment load command describes, or nullopt for any other
+// command. LC_SEGMENT and LC_SEGMENT_64 say the same things in fields of
+// different widths, and every caller below wants them widened anyway.
+struct MachSegment {
+    std::uint64_t vmaddr;
+    std::uint64_t vmsize;
+    std::uint64_t fileoff;
+    std::uint64_t filesize;
+};
+
+std::optional<MachSegment> segmentOf(const load_command* lc)
+{
+    if (lc->cmd == LC_SEGMENT_64) {
+        const auto* seg = reinterpret_cast<const segment_command_64*>(lc);
+        return MachSegment{seg->vmaddr, seg->vmsize, seg->fileoff, seg->filesize};
+    }
+    if (lc->cmd == LC_SEGMENT) {
+        const auto* seg = reinterpret_cast<const segment_command*>(lc);
+        return MachSegment{seg->vmaddr, seg->vmsize, seg->fileoff, seg->filesize};
+    }
+    return std::nullopt;
+}
+
+// Load commands are a packed list, each carrying its own length.
+const load_command* nextCommand(const load_command* lc)
+{
+    return reinterpret_cast<const load_command*>(
+        reinterpret_cast<const char*>(lc) + lc->cmdsize);
+}
+
+#endif // __APPLE__
 
 } // namespace
 
@@ -334,76 +368,53 @@ ImageStatsData getImageStats(const void* addressInImage)
     // this function is documented to take any image. The linked-at base is the
     // vmaddr of the segment covering file offset 0, which is the one carrying
     // the header itself.
-    std::uint64_t linkedBase = 0;
-    bool haveBase = false;
+    std::optional<std::uint64_t> linkedBase;
     const load_command* lc = reinterpret_cast<const load_command*>(commands);
-    for (std::uint32_t i = 0; i < header->ncmds && !haveBase; ++i) {
-        if (lc->cmd == LC_SEGMENT_64) {
-            const auto* seg = reinterpret_cast<const segment_command_64*>(lc);
-            if (seg->fileoff == 0 && seg->filesize > 0) { linkedBase = seg->vmaddr; haveBase = true; }
-        } else if (lc->cmd == LC_SEGMENT) {
-            const auto* seg = reinterpret_cast<const segment_command*>(lc);
-            if (seg->fileoff == 0 && seg->filesize > 0) { linkedBase = seg->vmaddr; haveBase = true; }
-        }
-        lc = reinterpret_cast<const load_command*>(
-            reinterpret_cast<const char*>(lc) + lc->cmdsize);
+    for (std::uint32_t i = 0; i < header->ncmds && !linkedBase; ++i, lc = nextCommand(lc)) {
+        const std::optional<MachSegment> seg = segmentOf(lc);
+        if (seg && seg->fileoff == 0 && seg->filesize > 0)
+            linkedBase = seg->vmaddr;
     }
-    if (!haveBase)
+    if (!linkedBase)
         return stats;
     const std::uint64_t slide =
-        reinterpret_cast<std::uintptr_t>(info.dli_fbase) - linkedBase;
+        reinterpret_cast<std::uintptr_t>(info.dli_fbase) - *linkedBase;
 
     bool residentKnown = false;
     lc = reinterpret_cast<const load_command*>(commands);
-    for (std::uint32_t i = 0; i < header->ncmds; ++i) {
-        std::uint64_t vmaddr = 0;
-        std::uint64_t vmsize = 0;
-        if (lc->cmd == LC_SEGMENT_64) {
-            const auto* seg = reinterpret_cast<const segment_command_64*>(lc);
-            vmaddr = seg->vmaddr;
-            vmsize = seg->vmsize;
-        } else if (lc->cmd == LC_SEGMENT) {
-            const auto* seg = reinterpret_cast<const segment_command*>(lc);
-            vmaddr = seg->vmaddr;
-            vmsize = seg->vmsize;
-        }
+    for (std::uint32_t i = 0; i < header->ncmds; ++i, lc = nextCommand(lc)) {
+        const std::optional<MachSegment> seg = segmentOf(lc);
         // vmaddr 0 is __PAGEZERO: address space reserved to make a null
         // dereference fault, never mapped and never the image's cost.
-        if (vmsize > 0 && vmaddr != 0) {
-            stats.mappedBytes += vmsize;
-            if (const std::optional<std::uint64_t> resident = residentBytesIn(
-                    reinterpret_cast<const void*>(
-                        static_cast<std::uintptr_t>(vmaddr + slide)), vmsize)) {
-                stats.residentBytes += *resident;
-                residentKnown = true;
-            }
+        if (!seg || seg->vmsize == 0 || seg->vmaddr == 0)
+            continue;
+        stats.mappedBytes += seg->vmsize;
+        if (const std::optional<std::uint64_t> resident = residentBytesIn(
+                reinterpret_cast<const void*>(
+                    static_cast<std::uintptr_t>(seg->vmaddr + slide)), seg->vmsize)) {
+            stats.residentBytes += *resident;
+            residentKnown = true;
         }
-        lc = reinterpret_cast<const load_command*>(
-            reinterpret_cast<const char*>(lc) + lc->cmdsize);
     }
 
+    // residentBytes only ever grows alongside mappedBytes, so no mapping means
+    // nothing was counted either.
     stats.resolved = stats.mappedBytes > 0;
     stats.residentKnown = residentKnown;
     if (info.dli_fname)
         stats.path = info.dli_fname;
-    if (!stats.resolved)
-        stats.residentBytes = 0;
     return stats;
 
 #elif defined(__linux__)
-    Dl_info info{};
-    ElfW(Sym)* symbol = nullptr;
-    void* mapBase = nullptr;
     // dladdr1 with RTLD_DL_LINKMAP hands back the link_map, whose l_addr is the
     // load bias this image was mapped with — the ELF half of the Mach-O slide
     // above. Plain dladdr's dli_fbase is the same value, but only dladdr1 also
     // gives the entry to match against dl_iterate_phdr below.
+    Dl_info info{};
     link_map* map = nullptr;
     if (::dladdr1(addressInImage, &info, reinterpret_cast<void**>(&map), RTLD_DL_LINKMAP) == 0
         || map == nullptr)
         return stats;
-    (void)symbol;
-    (void)mapBase;
 
     struct Walk {
         ElfW(Addr) wanted;

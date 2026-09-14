@@ -39,3 +39,7 @@ qrc_*
 # OS
 .DS_Store
 Thumbs.db
+
+# Nix build outputs
+result
+result-*
