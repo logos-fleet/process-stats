@@ -60,7 +60,7 @@ ProcessStats::clearHistory();
 
 ## Output format
 
-`ProcessStats::getModuleStats()` returns a JSON array with one entry per process in the input map (entries with an invalid PID, i.e. `pid <= 0`, are skipped). Each entry has the following fields:
+`ProcessStats::getModuleStats()` returns a JSON array with one entry per process in the input map (entries with `pid <= 0` are skipped: a NEGATIVE pid is the documented sentinel for code that runs inside the calling process and is skipped silently — see "Measuring code that has no process" below — while `pid == 0` is a defaulted value and is reported on stderr). Each entry has the following fields:
 
 - `name` — string. The process name, taken from the key in the input map.
 - `pid` — integer. The process ID, taken from the value in the input map.

@@ -226,7 +226,18 @@ char* getModuleStats(const std::unordered_map<std::string, int64_t>& processes)
     for (const auto& e : processes) {
         const std::string& pluginName = e.first;
         const int64_t pid = e.second;
-        if (pid <= 0) {
+        if (pid < 0) {
+            // THE IN-PROCESS SENTINEL, and not an error. A host that runs a
+            // module inside its own image reports -1 for it by construction,
+            // and the module is measured by getImageStats/ThreadCpuClock above
+            // rather than here. This used to print a line per module per stats
+            // tick -- four every two seconds on a phone -- saying "invalid PID"
+            // about the arrangement the platform requires.
+            continue;
+        }
+        if (pid == 0) {
+            // Zero is neither a process nor the sentinel: somebody passed a
+            // default-constructed value, which IS worth saying.
             std::fprintf(stderr, "process-stats: invalid PID for plugin: %s\n", pluginName.c_str());
             continue;
         }
